@@ -62,6 +62,33 @@ pip3 install -r requirements.txt
 pip3 install torch torchvision
 ```
 
+### Docker (GPU server)
+
+Requires a Linux x86_64 server with Docker, an NVIDIA driver compatible with CUDA 12.1,
+and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+The image uses PyTorch 2.1.1 / CUDA 12.1 and installs dependencies only; mount your code at `/workspace`.
+
+Run from the repository root on the server:
+
+```shell
+git submodule update --init --recursive
+docker build -t seqfeednet .
+docker run --rm -it --gpus all --shm-size=8g -v "$PWD:/workspace" seqfeednet
+```
+
+Inside the container, verify the environment and run training/testing as shown below:
+
+```shell
+python -c "import torch, Processor; print('PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda); assert torch.cuda.is_available(), 'CUDA unavailable'"
+python training.py --help
+```
+
+Place the prepared dataset in `Data/` under the repository, or add
+`-v /absolute/path/to/Data:/workspace/Data` to `docker run` before `seqfeednet`.
+If `Data/` contains symlinks, their targets must also be accessible inside the container.
+Outputs in `/workspace/out` persist in the host repository's `out/` directory.
+Code changes take effect immediately; rebuild the image when dependencies change.
+
 ## Dataset
 
 1. Download the CDnet 2014 Dataset:
@@ -98,6 +125,106 @@ python3 testing.py -cv $cross_validation_set --device 0 -weight <model_weight>
 # generate measurement csv & video result
 python3 testing.py -cv $cross_validation_set --device 0 -weight <model_weight> -save
 ```
+
+## Background subtraction on a video
+
+Run from the repository root (or `/workspace` inside Docker). This script uses the
+SeqFeedNet model directly and does not require the CDnet dataset:
+
+```shell
+python predict_video.py --video /path/to/input.mp4 --weights checkpoints/cv3.pt
+```
+
+On a GPU server, you can also run it directly in Docker without entering a shell:
+
+```shell
+docker run --rm --gpus all --shm-size=8g \
+  -v "$PWD:/workspace" -v /path/to/videos:/videos:ro \
+  seqfeednet python predict_video.py --video /videos/input.mp4 --output-dir out/demo
+```
+
+Processing is headless: no display server or GUI is needed. Mount the repository
+(including `checkpoints/`) at `/workspace`; the output directory above is saved in
+the host repository. Code is mounted, so adding this script does not require an image rebuild.
+
+The default checkpoint is `checkpoints/cv3.pt`. CUDA is selected automatically when
+available; use `--device cpu` or `--device 0` to select a device explicitly.
+Results are saved in `out/<video name>/`:
+
+- `overlay.mp4`: the original video with predicted foreground tinted translucent green;
+  background areas retain the original image. `--overlay-alpha` controls opacity (default `0.4`).
+- `masks/000000.png`, `masks/000001.png`, ...: lossless, single-channel `uint8`
+  binary masks at the exact source resolution. Foreground is `255` and background
+  is `0`. Frame numbering starts at zero and follows the decoded input frames;
+  there is no padding or frame sampling. `mask.mp4` is no longer generated.
+
+The command above needs no additional flags to save PNG masks. `--overwrite`
+replaces the overlay and removes previous numbered mask PNGs before writing the
+new sequence, so rerunning with fewer frames does not leave stale masks. Other
+files in the output directory are preserved. For batch resume checks, use
+`masks/000000.png` instead of `mask.mp4`, together with your completion marker.
+
+No background images are needed by default. The script estimates two references:
+the pixelwise median of the first 200 frames for the long-term reference, and the
+median of the last 100 frames within that initial window for the recent reference.
+It then processes the video from its first frame with the model's sequential feedback.
+For a shorter video, it uses the available frames; the references can coincide if
+fewer than 100 frames are available. Customize the windows with:
+
+```shell
+python predict_video.py --video input.mp4 --empty-frames 200 --recent-frames 100 --output-dir out/demo
+```
+
+This is offline initialization using frames from the beginning of the video,
+including frames later than the first output frame. It approximates the two kinds
+of reference used by the official repository; it does not reproduce its precomputed
+background data. Medians are computed at the original video resolution, with the
+same lower-middle convention as `torch.median`. The initial difference is computed
+before the repository's antialiased bilinear resize and normalization. Temporary
+disk storage and row blocks avoid keeping all decoded samples in RAM; initialization
+needs scratch space of approximately `frames * width * height * 3` bytes under
+`TMPDIR` (normally `/tmp`), released after the references have been computed.
+For moving cameras, `--ptz` defaults to 100/30-frame initialization windows; video-only
+mode still uses a fixed empty reference after initialization. Objects that remain
+in the same area during initialization can become part of the estimated background.
+
+If a clean background image from the same camera view is available, use:
+
+```shell
+python predict_video.py --video input.mp4 --background empty_background.jpg --output-dir out/demo
+```
+
+The legacy `--background-frames` option is an alias for `--empty-frames`.
+`--threshold` changes the mask threshold (default `0.5`). `--max-size` controls
+inference resolution (default `640` for estimated references, rounded down to
+multiples of 16); `--max-size 0` keeps native resolution rounded down to multiples
+of 16. Use `--max-frames 100` for a short trial and `--overwrite` to replace existing
+outputs. The overlay retains source FPS and resolution (odd dimensions are padded
+by one pixel for MP4 encoding); audio is not copied. PNG masks retain the original
+width and height even when either dimension is odd.
+
+To use already prepared backgrounds with the repository's selection rules:
+
+```shell
+python predict_video.py --video input.mp4 \
+  --empty-bg-dir /path/to/emptyBg/this_video \
+  --recent-bg /path/to/recentBg/this_video/first_frame.jpg
+```
+
+Both references must match this video and its original resolution. In this mode,
+30 empty-background images are sampled **with replacement**, and their lower median
+is used, matching `torch.median` in `utils/data_process.py`. Separate draws provide
+the initial feature reference and the foreground network's reference, as in the
+dataset loader. `--seed` controls sampling (default `0`); a seed does not reproduce
+the global random state of a separate dataset evaluation. The difference reference
+is computed before the repository's antialiased bilinear resize and normalization.
+This mode defaults to native inference resolution rounded down to multiples of 16.
+
+For prepared PTZ references, add `--ptz`: files in `--empty-bg-dir` are sorted by name
+and read one per input frame. The first file must align with the first video frame;
+`--recent-bg` supplies the recent reference for initialization. A missing per-frame
+reference raises an error. Prepared-reference options cannot be mixed with the
+automatic-estimation options.
 
 ## Demo
 
