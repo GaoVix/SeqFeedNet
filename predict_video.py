@@ -13,7 +13,7 @@ from torchvision.transforms.functional import resize
 
 from models.SeqFeedNet import SeqFeedNet
 from models.unet import UNetVgg16
-from utils.video_background import estimate_video_backgrounds, load_repo_backgrounds, read_background
+from utils.video_background import BackgroundReferences, estimate_video_backgrounds, load_repo_backgrounds, read_background
 
 
 def load_model(weights_path: Path, device: torch.device) -> SeqFeedNet:
@@ -133,7 +133,7 @@ def run(args):
     masks_dir = output_dir / 'masks'
     input_paths = {
         path.resolve()
-        for path in [args.video, args.weights, args.background, args.recent_bg, args.empty_bg_dir]
+        for path in [args.video, args.weights, args.background, args.shared_background, args.recent_bg, args.empty_bg_dir]
         if path is not None
     }
     for path in [overlay_path, masks_dir]:
@@ -151,7 +151,7 @@ def run(args):
             raise ValueError(f'Cannot decode video: {args.video}')
         height, width = frame.shape[:2]
         repo_mode = args.empty_bg_dir is not None
-        max_size = args.max_size if args.max_size is not None else (0 if repo_mode else 640)
+        max_size = args.max_size if args.max_size is not None else 0
         size = inference_size(width, height, max_size)
         fps = capture.get(cv2.CAP_PROP_FPS)
         if not math.isfinite(fps) or fps <= 0:
@@ -159,11 +159,16 @@ def run(args):
             print('Video FPS is unavailable; using 30 FPS.', flush=True)
 
         background = None
-        if args.background is not None:
-            background = read_background(args.background, (height, width))
+        background_path = args.shared_background or args.background
+        if background_path is not None:
+            background = read_background(background_path, (height, width))
         print(f'Loading checkpoint: {args.weights.resolve()}', flush=True)
         model = load_model(args.weights, device)
-        if repo_mode:
+        if args.shared_background is not None:
+            references = BackgroundReferences(background, background, background)
+            print('Background mode: shared (provided image for empty and recent references; '
+                  'no video background estimation).', flush=True)
+        elif repo_mode:
             references = load_repo_backgrounds(args.empty_bg_dir, args.recent_bg, (height, width), args.seed, args.ptz)
         else:
             references = estimate_video_backgrounds(args.video, args.empty_frames, args.recent_frames, background)
@@ -221,11 +226,15 @@ def main():
     parser.add_argument('--recent-bg', type=Path, help='Repo mode: recentBg image aligned with the first input frame')
     parser.add_argument('--ptz', action='store_true', help='PTZ mode: per-frame emptyBg references, or 100/30-frame estimates')
     parser.add_argument('--seed', type=int, default=0, help='Seed for the repo mode random background selection')
-    parser.add_argument('--background', type=Path, help='Estimate mode: optional clean background image at video resolution')
+    background_options = parser.add_mutually_exclusive_group()
+    background_options.add_argument('--background', type=Path,
+                                    help='Estimate mode: clean empty background; recent is still estimated from video')
+    background_options.add_argument('--shared-background', type=Path,
+                                    help='Use one image for empty and recent references; skip video background estimation')
     parser.add_argument('--empty-frames', '--background-frames', type=int, help='Estimate mode: warm-up frames (default: 200, or 100 for PTZ)')
     parser.add_argument('--recent-frames', type=int, help='Estimate mode: recent tail of warm-up frames (default: up to 100, or 30 for PTZ)')
     parser.add_argument('--device', default='auto', help='auto, cpu, cuda:0, or a GPU index such as 0')
-    parser.add_argument('--max-size', type=int, help='Maximum inference dimension; 0 keeps native size (default: 0 in repo mode, 640 in estimate mode)')
+    parser.add_argument('--max-size', type=int, default=0, help='Maximum inference dimension; 0 keeps native size (default: 0)')
     parser.add_argument('--threshold', type=float, default=0.5, help='Foreground probability threshold')
     parser.add_argument('--overlay-alpha', type=float, default=0.4, help='Green foreground overlay opacity, from 0 to 1')
     parser.add_argument('--max-frames', type=int, default=0, help='Limit output frames; 0 processes the entire video')
@@ -241,8 +250,10 @@ def main():
         parser.error('--max-frames must be >= 0')
     if (args.empty_bg_dir is None) != (args.recent_bg is None):
         parser.error('Repo mode requires both --empty-bg-dir and --recent-bg')
-    if args.empty_bg_dir is not None and any(value is not None for value in [args.background, args.empty_frames, args.recent_frames]):
-        parser.error('--background, --empty-frames and --recent-frames are only used in estimate mode')
+    if args.empty_bg_dir is not None and any(value is not None for value in [args.background, args.shared_background, args.empty_frames, args.recent_frames]):
+        parser.error('--background, --shared-background, --empty-frames and --recent-frames cannot be used in repo mode')
+    if args.shared_background is not None and any(value is not None for value in [args.empty_frames, args.recent_frames]):
+        parser.error('--shared-background skips estimation; do not supply --empty-frames or --recent-frames')
     if args.empty_frames is None:
         args.empty_frames = 100 if args.ptz else 200
     if args.recent_frames is None:
